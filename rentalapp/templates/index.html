@@ -64,7 +64,7 @@
   <nav class="pc-sidebar">
     <div class="navbar-wrapper">
       <div class="m-header">
-        <a href="dashboard/index.html" class="b-brand text-primary">
+        <a href="{% url 'index_page' %}" class="b-brand text-primary">
           <!-- ========   Change your logo from here   ============ -->
           <img src="{% static 'assets/images/logo-white.svg' %}" class="img-fluid logo-lg" alt="logo" />
         </a>
@@ -72,9 +72,9 @@
       <div class="navbar-content">
         <ul class="pc-navbar">
           <li class="pc-item pc-caption">
-            <label data-i18n="Navigation">Navigation</label>
+            <label>Rental Management</label>
           </li>
-          <li class="pc-item">
+          <li class="pc-item active">
             <a href="{% url 'index_page' %}" class="pc-link">
               <span class="pc-micon">
                 <i class="ph ph-house-line"></i>
@@ -82,51 +82,78 @@
               <span class="pc-mtext">Dashboard</span>
             </a>
           </li>
-          <li class="pc-item pc-hasmenu">
-            <a href="#!" class="pc-link">
-              <span class="pc-micon">
-                <i class="ph ph-layout"></i>
-              </span>
-              <span class="pc-mtext">Bookings</span>
-              <span class="pc-arrow"><i class="ti ti-chevron-right"></i></span>
-            </a>
-            <ul class="pc-submenu">
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_Booking_page' %}">Make Booking</a></li>
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_Tenant_page' %}">Add Tenant</a></li>
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_broker_page' %}">Add Broker</a></li>
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_Complaint_page' %}">Add Complaint</a></li>
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_Location_page' %}">Add Location</a></li>
-            </ul>
-          </li>
-          <li class="pc-item pc-hasmenu">
-            <a href="#!" class="pc-link">
-              <span class="pc-micon">
-                <i class="ph ph-flower-lotus"></i>
-              </span>
-              <span class="pc-mtext">Payments</span>
-              <span class="pc-arrow"><i class="ti ti-chevron-right"></i></span>
-            </a>
-            <ul class="pc-submenu">
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_Payment_page' %}">Make Payment</a></li>
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_landlord_page' %}">Add Landlord</a></li>
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_Notification_page' %}">Notifications</a></li>
-            </ul>
+
+          <li class="pc-item pc-caption">
+            <label>Property Management</label>
           </li>
           <li class="pc-item pc-hasmenu">
             <a href="#!" class="pc-link">
               <span class="pc-micon">
                 <i class="ph ph-buildings"></i>
               </span>
-              <span class="pc-mtext">Property</span>
+              <span class="pc-mtext">Properties</span>
               <span class="pc-arrow"><i class="ti ti-chevron-right"></i></span>
             </a>
             <ul class="pc-submenu">
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_property_page' %}">Add Property</a></li>
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_Unit_page' %}">Add Unit</a></li>
-              <li class="pc-item"><a class="pc-link" href="{% url 'add_MaintenanceRequest_page' %}">Maintenance
-                  Requests</a></li>
+              <li class="pc-item"><a class="pc-link" href="{% url 'add_property_page' %}">Properties</a></li>
+              <li class="pc-item"><a class="pc-link" href="{% url 'add_Unit_page' %}">Units</a></li>
+              <li class="pc-item"><a class="pc-link" href="{% url 'add_Location_page' %}">Locations</a></li>
             </ul>
           </li>
+
+          <li class="pc-item pc-caption">
+            <label>People &amp; Leasing</label>
+          </li>
+          <li class="pc-item pc-hasmenu">
+            <a href="#!" class="pc-link">
+              <span class="pc-micon">
+                <i class="ph ph-users-three"></i>
+              </span>
+              <span class="pc-mtext">People</span>
+              <span class="pc-arrow"><i class="ti ti-chevron-right"></i></span>
+            </a>
+            <ul class="pc-submenu">
+              <li class="pc-item"><a class="pc-link" href="{% url 'add_Tenant_page' %}">Tenants</a></li>
+              <li class="pc-item"><a class="pc-link" href="{% url 'add_landlord_page' %}">Landlords</a></li>
+              <li class="pc-item"><a class="pc-link" href="{% url 'add_broker_page' %}">Brokers</a></li>
+            </ul>
+          </li>
+          <li class="pc-item pc-hasmenu">
+            <a href="#!" class="pc-link">
+              <span class="pc-micon">
+                <i class="ph ph-calendar-check"></i>
+              </span>
+              <span class="pc-mtext">Leasing</span>
+              <span class="pc-arrow"><i class="ti ti-chevron-right"></i></span>
+            </a>
+            <ul class="pc-submenu">
+              <li class="pc-item"><a class="pc-link" href="{% url 'add_Booking_page' %}">Bookings</a></li>
+              <li class="pc-item"><a class="pc-link" href="{% url 'add_Payment_page' %}">Payments</a></li>
+            </ul>
+          </li>
+
+          <li class="pc-item pc-caption">
+            <label>Service &amp; Communication</label>
+          </li>
+          <li class="pc-item">
+            <a href="{% url 'add_MaintenanceRequest_page' %}" class="pc-link">
+              <span class="pc-micon"><i class="ph ph-wrench"></i></span>
+              <span class="pc-mtext">Maintenance</span>
+            </a>
+          </li>
+          <li class="pc-item">
+            <a href="{% url 'add_Complaint_page' %}" class="pc-link">
+              <span class="pc-micon"><i class="ph ph-warning-circle"></i></span>
+              <span class="pc-mtext">Complaints</span>
+            </a>
+          </li>
+          <li class="pc-item">
+            <a href="{% url 'add_Notification_page' %}" class="pc-link">
+              <span class="pc-micon"><i class="ph ph-bell"></i></span>
+              <span class="pc-mtext">Notifications</span>
+            </a>
+          </li>
+          {% comment %}Unused links supplied by the dashboard demo are intentionally excluded from this system sidebar.
           <li class="pc-item pc-caption">
             <label data-i18n="UI Components">UI Components</label>
             <i class="ph ph-pencil-ruler"></i>
@@ -719,8 +746,7 @@
                 data-i18n="Landing">Landing</span>
             </a>
           </li>
-
-
+          {% endcomment %}
         </ul>
       </div>
     </div>
