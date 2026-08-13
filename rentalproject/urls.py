@@ -1,64 +1,38 @@
-"""
-URL configuration for rentalproject project.
-
-The `urlpatterns` list routes URLs to views. For more information please see:
-    https://docs.djangoproject.com/en/6.0/topics/http/urls/
-Examples:
-Function views
-    1. Add an import:  from my_app import views
-    2. Add a URL to urlpatterns:  path('', views.home, name='home')
-Class-based views
-    1. Add an import:  from other_app.views import Home
-    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
-Including another URLconf
-    1. Import the include() function: from django.urls import include, path
-    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
-"""
 from django.contrib import admin
+from django.contrib.auth import views as auth_views
 from django.urls import path
-from rentalapp.views import *
+
+from rentalapp import views
+
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
-    path('',login_view,name='index_page'),
-    path('add_Tenant/',add_Tenant_view,name ='add_Tenant_page'),
-    path('add_Booking/',add_Booking_view,name ='add_Booking_page'),
-    path('add_Location/',add_Location_view,name ='add_Location_page'),
-    path('add_Payment/',add_Payment_view,name ='add_Payment_page'),
-    path('add_broker/',add_broker_view,name = 'add_broker_page'),
-    path('add_landlord/',add_landlord_view, name='add_landlord_page'),
-    path('add_property/',add_property_view, name= 'add_property_page'),
-    path('add_MaintenanceRequest/',add_MaintenanceRequest_view, name ='add_MaintenanceRequest_page'),
-    path('add_Complaint/', add_complaint_view, name='add_Complaint_page'),
-    path('add_Unit/', add_Unit_view, name='add_Unit_page'),
-    path('add_Notification/',add_Notification_view,name ='add_Notification_page'),
+    path("admin/", admin.site.urls),
+    path("", views.dashboard, name="dashboard"),
+    path("login/", auth_views.LoginView.as_view(template_name="registration/login.html"), name="login"),
+    path("logout/", auth_views.LogoutView.as_view(next_page="dashboard"), name="logout"),
+    path("search/", views.global_search, name="global_search"),
+    path("properties/", views.property_list, name="property_list"),
+    path("properties/<int:pk>/", views.property_detail, name="property_detail"),
+    path("units/", views.unit_list, name="unit_list"),
+    path("units/<int:pk>/", views.unit_detail, name="unit_detail"),
+    path("tenants/", views.tenant_list, name="tenant_list"),
+    path("tenants/<int:pk>/", views.tenant_detail, name="tenant_detail"),
+    path("leases/", views.lease_list, name="lease_list"),
+    path("leases/<int:pk>/", views.lease_detail, name="lease_detail"),
+    path("payments/", views.payment_list, name="payment_list"),
+    path("payments/record/", views.payment_create, name="payment_create"),
+    path("payments/<int:pk>/receipt/", views.receipt_detail, name="receipt_detail"),
+    path("payments/<int:pk>/void/", views.payment_void, name="payment_void"),
+    path("arrears/", views.arrears, name="arrears"),
+    path("maintenance/", views.maintenance_list, name="maintenance_list"),
+    path("expenses/", views.expense_list, name="expense_list"),
+    path("reports/", views.reports, name="reports"),
+    path("audit-logs/", views.audit_log_list, name="audit_logs"),
 
-    #edits
-    path('edit_property/<int:id>/',edit_property_view,name ='edit_property_page'),
-    path('edit_payment/<int:id>/', edit_Payment_view, name='edit_Payment_page'),
-    path('edit_Booking/<int:id>/',edit_Booking_view, name = 'edit_Booking_page'),
-    path('edit_broker/<int:id>/',edit_broker_view, name = 'edit_broker_page'),
-    path('edit_Location/<int:id>/', edit_Location_view, name='edit_Location_page'),
-    path('edit_landlord/<int:id>/', edit_landlord_view, name='edit_landlord_page'),
-    path('edit_Tenant/<int:id>/', edit_Tenant_view, name='edit_Tenant_page'),
-    path('edit_MaintenanceRequest/<int:id>/', edit_MaintenanceRequest_view, name='edit_MaintenanceRequest_page'),
-    path('edit_Complaint/<int:id>/', edit_Complaint_view, name='edit_Complaint_page'),
-    path('edit_Unit/<int:id>/', edit_Unit_view, name='edit_Unit_page'),
-    path('edit_Notification/<int:id>/', edit_Notification_view, name='edit_Notification_page'),
-
-
-    #delete
-    path('delete_property/<int:id>/',delete_property_view,name='delete_property'),
-    path('delete_Payment/<int:id>/', delete_Payment_view, name='delete_Payment'),
-    path('delete_Location/<int:id>/', delete_location_view, name='delete_Location'),
-    path('delete_landlord/<int:id>/', delete_landlord_view, name='delete_landlord'),
-    path('delete_unit/<int:id>/', delete_unit_view, name='delete_unit'),
-    path('delete_tenant/<int:id>/', delete_tenant_view, name='delete_tenant'),
-    path('delete_broker/<int:id>/', delete_broker_view, name='delete_broker'),
-    path('delete_Booking/<int:id>/', delete_booking_view, name='delete_Booking'),
-    path('delete_MaintenanceRequest/<int:id>/', delete_MaintenanceRequest_view, name='delete_MaintenanceRequest'),
-    path('delete_complaint/<int:id>/', delete_complaint_view, name='delete_complaint'),
-    path('delete_Notification/<int:id>/', delete_Notifications_view, name= 'delete_Notification_page'),
+    # Non-breaking aliases for the original prototype routes.
+    path("add_property/", views.property_list, name="add_property_page"),
+    path("add_Unit/", views.unit_list, name="add_Unit_page"),
+    path("add_Tenant/", views.tenant_list, name="add_Tenant_page"),
+    path("add_Payment/", views.payment_list, name="add_Payment_page"),
+    path("add_MaintenanceRequest/", views.maintenance_list, name="add_MaintenanceRequest_page"),
 ]
-
-
