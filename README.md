@@ -40,6 +40,14 @@ Financial records are append-only: payments, allocations, receipts, refunds, dep
 
 Open <http://127.0.0.1:8000/>. New Django users receive the `Viewer` role. Assign their operational role under **User profiles** in Django Admin before they use the staff workspace. Link landlord and tenant portal accounts through the corresponding `user` field.
 
+## Load Uganda demo data
+
+```bash
+./.venv/bin/python seed.py
+```
+
+The idempotent seed creates fictional Uganda-oriented records across the complete workflow, including 10 landlords, 10 properties, 20 units, 10 tenants, 20 applications, 10 leases and at least 10 records in each major operational module. It also prints the local demo credentials when complete. Never use the demo identities, phone numbers, references or password in production.
+
 ## Daily operations
 
 Run this command daily from cron, systemd or the deployment scheduler:
