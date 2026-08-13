@@ -1,539 +1,629 @@
-from django.shortcuts import render
-from rentalapp.forms import PropertyForm
-from rentalapp.models import Property
-from rentalapp.forms import PaymentForm
-from rentalapp.models import Payment
-from rentalapp.forms import BookingForm
-from rentalapp.models import Booking
-from rentalapp.forms import LocationForm
-from rentalapp.models import Location
-from rentalapp.forms import landlordForm
-from rentalapp.models import landlord
-from rentalapp.forms import brokerForm
-from rentalapp.models import broker
-from rentalapp.forms import TenantForm
-from rentalapp.models import Tenant
-from rentalapp.forms import MaintenanceRequestForm
-from rentalapp.models import MaintenanceRequest
-from rentalapp.forms import ComplaintForm
-from rentalapp.models import Complaint
-from rentalapp.forms import UnitForm
-from rentalapp.models import Unit
-from rentalapp.forms import NotificationForm
-from rentalapp.models import Notification
+from collections import defaultdict
+from datetime import timedelta
+from decimal import Decimal
+from functools import wraps
 
-# Create your views here.
-def login_view(request):
-  return render(request,'index.html')
+from django.contrib import messages
+from django.contrib.auth.views import redirect_to_login
+from django.db.models import Q, Sum
+from django.http import HttpResponseNotAllowed
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
+from django.utils import timezone
 
-# def tentents_view(request):
-#     return render(request,'tentents.html')
-
-# def booking_view(request):
-#     return render(request,'booking.html')  
-
-# def location_view(request):
-#     return render(request,'location.html')
-
-# def payment_view(request):
-#     return render(request,'payment.html') 
-
-# def broker_view(request):
-#     return render(request,'broker.html')  
-
-# def landloard_view(request):
-#     return render(request,'landloard.html')  
+from .forms import (
+    ExpenseForm,
+    LeaseForm,
+    MaintenanceRequestForm,
+    PaymentForm,
+    PropertyForm,
+    TenantForm,
+    UnitForm,
+    VoidPaymentForm,
+)
+from .models import (
+    AuditLog,
+    Expense,
+    Lease,
+    MaintenanceRequest,
+    Notification,
+    Payment,
+    Property,
+    RentCharge,
+    Tenant,
+    Unit,
+)
+from .services import assign_reference, audit, generate_rent_schedule, post_payment, synchronize_occupancy, void_payment
 
 
+def _actor(request):
+    return request.user if request.user.is_authenticated else None
 
-from django.shortcuts import get_object_or_404, render, redirect
-from .forms import PropertyForm
-from .models import Property
 
-def add_property_view(request):
-    if request.method == "POST":
-        form = PropertyForm(request.POST)
-        if form.is_valid():
-            form.save()
-            return redirect('add_property_page')
-    else:
-        form = PropertyForm()
+def post_login_required(view):
+    """Keep the development preview readable, but never allow anonymous writes."""
+    @wraps(view)
+    def wrapped(request, *args, **kwargs):
+        if request.method == "POST" and not request.user.is_authenticated:
+            return redirect_to_login(request.get_full_path())
+        return view(request, *args, **kwargs)
 
-    property = Property.objects.all()
+    return wrapped
 
-    context = {
-        'form': form,
-        'property': property,
+
+def _form_errors(request, form):
+    messages.error(request, "Please correct the highlighted fields and try again.")
+    return form
+
+
+def dashboard(request):
+    today = timezone.localdate()
+    period = today.replace(day=1)
+    properties = list(Property.objects.filter(status="active").prefetch_related("units"))
+    units = Unit.objects.select_related("property")
+    total_units = units.count()
+    occupied_units = units.filter(status=Unit.Status.OCCUPIED).count()
+    vacant_units = units.filter(status=Unit.Status.AVAILABLE).count()
+    maintenance_units = units.filter(status=Unit.Status.MAINTENANCE).count()
+    occupancy_rate = round((occupied_units / total_units * 100), 1) if total_units else 0
+
+    current_charges = list(
+        RentCharge.objects.filter(period=period).select_related("lease__tenant", "lease__unit__property")
+    )
+    expected_rent = sum((item.amount for item in current_charges), Decimal("0"))
+    collected_rent = sum((item.allocated_amount for item in current_charges), Decimal("0"))
+    collection_rate = round((collected_rent / expected_rent * 100), 1) if expected_rent else 0
+
+    overdue_charges = [
+        charge
+        for charge in RentCharge.objects.filter(due_date__lte=today)
+        .exclude(status__in=(RentCharge.Status.PAID, RentCharge.Status.VOID))
+        .select_related("lease__tenant", "lease__unit__property")
+        if charge.balance > 0
+    ]
+    outstanding = sum((charge.balance for charge in overdue_charges), Decimal("0"))
+    affected_tenants = len({charge.lease.tenant_id for charge in overdue_charges})
+    arrears_buckets = _arrears_buckets(overdue_charges, today)
+
+    maintenance_counts = {
+        key: MaintenanceRequest.objects.filter(status=key).count()
+        for key in (
+            MaintenanceRequest.Status.NEW,
+            MaintenanceRequest.Status.ASSIGNED,
+            MaintenanceRequest.Status.IN_PROGRESS,
+            MaintenanceRequest.Status.AWAITING_PARTS,
+        )
     }
+    maintenance_counts["completed"] = MaintenanceRequest.objects.filter(
+        status__in=(MaintenanceRequest.Status.COMPLETED, MaintenanceRequest.Status.VERIFIED, MaintenanceRequest.Status.CLOSED),
+        updated_at__year=today.year,
+        updated_at__month=today.month,
+    ).count()
 
-    return render(request, 'add_propertyform.html', context)
-
-def edit_property_view(request,id):
-    property = get_object_or_404(Property, pk=id)
-    if request.method == "POST":
-        form = PropertyForm(request.POST, instance=property)
-        if form.is_valid():
-            form.save()
-            return redirect('add_property_page')
-    else:
-        form = PropertyForm(instance=property)
-
-    context ={
-        "form":form,
-        "property":property
-    }
-    return render (request, 'edits/edit_property.html',context)
-
-def delete_property_view(request, id):
-    property = get_object_or_404(Property, pk=id)
-    property.delete()
-    return redirect('add_property_page') 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def add_Payment_view(request):
-    if request.method == "POST":
-        form = PaymentForm(request.POST)
-        if form.is_valid():
-            form.save()
-            # return redirect('payment')   # Use your URL name here
-    else:
-        form = PaymentForm()
-    payment = Payment.objects.all() 
-
-    context ={
-        'form':form,
-        'payments':payment,
-    }   
-
-    return render(request, 'add_Paymentform.html',context)
-
-
-   
-
-def edit_Payment_view(request, id):
-    payment = get_object_or_404(Payment, pk=id)
-
-    if request.method == "POST":
-        form = PaymentForm(request.POST, instance=payment)
-        if form.is_valid():
-            form.save()
-            return redirect('add_Payment_page')
-    else:
-        form = PaymentForm(instance=payment)
-
-    context = {
-        "form": form,
-        "payment": payment,
-    }
-    return render(request, "edits/edit_Payment.html", context)
-
-def delete_Payment_view(request, id):
-    payment = get_object_or_404(Payment, pk=id)
-    payment.delete()
-    return redirect('add_Payment_page')   
-   
-def add_Booking_view(request):
-    if request.method == "POST":
-        form = BookingForm(request.POST)
-        if form.is_valid():
-            form.save()
-            # return redirect('booking')
-         
-    else:
-        form = BookingForm()     # Create an empty form for GET requests
-
-    booking = Booking.objects.all()
-
-    context = {
-        'form': form,
-        'booking': booking,
-    }
-
-    return render(request, 'add_Bookingform.html', context)  
-
-def edit_Booking_view(request, id):
-    booking = get_object_or_404(Booking, pk=id)
-
-    if request.method == "POST":
-        form = BookingForm(request.POST, instance=booking)
-        if form.is_valid():
-            form.save()
-            return redirect('add_Booking_page')
-    else:
-        form = BookingForm(instance=booking)
-
-    context = {
-        "form": form,
-        "booking": booking,
-    }
-    return render(request, "edits/edit_Booking.html", context) 
-
-def delete_booking_view(request, id):
-    booking = get_object_or_404(Booking, pk=id)
-    booking.delete()
-    return redirect('add_booking_page')       
-
-
-
-
-def add_Location_view(request):
-    if request.method == "POST":
-        form = LocationForm(request.POST)
-        if form.is_valid():
-            form.save()
-           # return redirect('Location')   # Make sure this URL name exists
-    else:
-        form = LocationForm()
-    locations =Location.objects.all()
-    context ={'form':form,
-         'locations':locations,
-        }
-    return render(request, 'add_Locationform.html', context)
-
-def edit_Location_view(request, id):
-    location = get_object_or_404(Location, pk=id)
-
-    if request.method == "POST":
-        form = LocationForm(request.POST, instance=location)
-        if form.is_valid():
-            form.save()
-            return redirect('add_Location_page')
-    else:
-        form = LocationForm(instance=location)
-
-    context = {
-        "form": form,
-        "location": location,
-    }
-    return render(request, "edits/edit_Location.html", context)
-
-def delete_location_view(request, id):
-    location = get_object_or_404(Location, pk=id)
-    location.delete()
-    return redirect('add_Location_page')            
-
-
-def add_broker_view(request):
-    if request.method == "POST":
-        form = brokerForm(request.POST)
-        if form.is_valid():
-            form.save()
-           # return redirect('broker')   # Change to your booking list URL
-    else:
-        form = brokerForm()
-
-    brokers = broker.objects.all()
-    context ={'form':form,
-            'brokers':brokers, 
+    recent_activity = []
+    for payment in Payment.objects.select_related("lease__tenant", "lease__unit").all()[:6]:
+        recent_activity.append(
+            {
+                "time": payment.created_at,
+                "icon": "ph-wallet",
+                "tone": "success" if payment.status == Payment.Status.POSTED else "danger",
+                "title": "Rent payment received" if payment.status == Payment.Status.POSTED else "Payment voided",
+                "detail": f"{payment.lease.unit.unit_number if payment.lease else 'Unassigned'} · UGX {payment.amount:,.0f}",
+                "url": reverse("receipt_detail", args=[payment.pk]),
             }
+        )
+    for item in MaintenanceRequest.objects.select_related("unit").all()[:6]:
+        recent_activity.append(
+            {
+                "time": item.created_at,
+                "icon": "ph-wrench",
+                "tone": "warning",
+                "title": "Maintenance request created",
+                "detail": f"{item.unit.unit_number} · {item.title}",
+                "url": reverse("maintenance_list"),
+            }
+        )
+    recent_activity = sorted(recent_activity, key=lambda item: item["time"], reverse=True)[:7]
 
-    return render(request, 'add_brokerform.html', context) 
+    expiring_leases = Lease.objects.filter(
+        status__in=(Lease.Status.ACTIVE, Lease.Status.EXPIRING),
+        end_date__range=(today, today + timedelta(days=45)),
+    ).select_related("tenant", "unit__property")[:5]
 
-def edit_broker_view(request, id):
-    broker = get_object_or_404(broker, pk=id)
-
-    if request.method == "POST":
-        form = brokerForm(request.POST, instance=broker)
-        if form.is_valid():
-            form.save()
-            return redirect('add_broker_page')
-    else:
-        form = brokerForm(instance=broker)
-
-    context = {
-        "form": form,
-        "broker": broker_,
-    }
-
-    return render(request, "edits/edit_broker.html", context) 
-def delete_broker_view(request, id):
-    brokers = get_object_or_404(broker, pk=id)
-    brokers.delete()
-    return redirect('add_broker_page')       
-
-
-
-def add_landlord_view(request):
-    if request.method == "POST":
-        form = landlordForm(request.POST)
-        if form.is_valid():
-            form.save()
-           # return redirect('landlord')   # Ensure this URL name exists
-    else:
-        form = landlordForm()
-    landlords =landlord.objects.all()
-    context={'form':form,
-        'landlords':landlords,
-
-    }
-
-    return render(request, 'add_landlordform.html', context)
-
-def edit_landlord_view(request, id):
-    landlords = get_object_or_404(landlord, pk=id)
-
-    if request.method == "POST":
-        form = landlordForm(request.POST, instance=landlord)
-
-        if form.is_valid():
-            form.save()
-            return redirect('landlord_page')
-
-    else:
-        form = landlordForm(instance=landlord_record)
+    months = []
+    cursor = period
+    for _ in range(6):
+        months.append(cursor)
+        cursor = (cursor - timedelta(days=1)).replace(day=1)
+    months.reverse()
+    month_totals = defaultdict(Decimal)
+    for row in (
+        Payment.objects.filter(status=Payment.Status.POSTED, payment_date__gte=months[0])
+        .values("payment_date__year", "payment_date__month")
+        .annotate(total=Sum("amount"))
+    ):
+        month_totals[(row["payment_date__year"], row["payment_date__month"])] = row["total"]
+    collection_trend = [
+        {"label": month.strftime("%b"), "amount": month_totals[(month.year, month.month)]} for month in months
+    ]
+    max_collection = max((item["amount"] for item in collection_trend), default=Decimal("0"))
+    for item in collection_trend:
+        item["height"] = round(item["amount"] / max_collection * 100) if max_collection else 4
 
     context = {
-        "form": form,
-        "landlord": landlord_record,
+        "today": today,
+        "properties_count": len(properties),
+        "total_units": total_units,
+        "occupied_units": occupied_units,
+        "vacant_units": vacant_units,
+        "maintenance_units": maintenance_units,
+        "occupancy_rate": occupancy_rate,
+        "expected_rent": expected_rent,
+        "collected_rent": collected_rent,
+        "collection_rate": collection_rate,
+        "outstanding": outstanding,
+        "affected_tenants": affected_tenants,
+        "arrears_buckets": arrears_buckets,
+        "maintenance_counts": maintenance_counts,
+        "recent_activity": recent_activity,
+        "expiring_leases": expiring_leases,
+        "collection_trend": collection_trend,
     }
-
-    return render(request, "edits/edit_landlord.html", context)
-
-def delete_landlord_view(request, id):
-    landlords = get_object_or_404(landlord, pk=id)
-    landlords.delete()
-    return redirect('add_landlord_page')
+    return render(request, "dashboard.html", context)
 
 
-def add_Tenant_view(request):
+@post_login_required
+def property_list(request):
+    form = PropertyForm(request.POST or None)
     if request.method == "POST":
-        form = TenantForm(request.POST)
         if form.is_valid():
-            form.save()
-            #return redirect('Tenant')   # Make sure this URL name exists
-    else:
-        form = TenantForm()
-    tenant =Tenant.objects.all()
+            item = form.save()
+            audit(actor=_actor(request), action="property_created", instance=item, request=request)
+            messages.success(request, f"{item.name} was added successfully.")
+            return redirect(item)
+        _form_errors(request, form)
+    queryset = Property.objects.select_related("owner").prefetch_related("units")
+    query = request.GET.get("q", "").strip()
+    status = request.GET.get("status", "")
+    if query:
+        queryset = queryset.filter(Q(name__icontains=query) | Q(address__icontains=query) | Q(district__icontains=query))
+    if status:
+        queryset = queryset.filter(status=status)
+    properties = list(queryset)
+    for item in properties:
+        item.display_units = len(item.units.all())
+        item.display_occupied = sum(unit.status == Unit.Status.OCCUPIED for unit in item.units.all())
+        item.display_vacant = sum(unit.status == Unit.Status.AVAILABLE for unit in item.units.all())
+        item.display_rent = sum((unit.rent_amount for unit in item.units.all()), Decimal("0"))
+    return render(request, "properties/list.html", {"properties": properties, "form": form, "query": query, "status": status})
 
-    context ={
-        'form':form,
-        'tenants':tenant,}
 
-    return render(request, 'add_Tenantform.html', context) 
-
-def edit_Tenant_view(request, id):
-    tenant = get_object_or_404(Tenant, pk=id)
-
-    if request.method == "POST":
-        form = TenantForm(request.POST, instance=tenant)
-        if form.is_valid():
-            form.save()
-            return redirect('add_Tenant_page')
-    else:
-        form = TenantForm(instance=tenant)
-
+def property_detail(request, pk):
+    item = get_object_or_404(Property.objects.select_related("owner"), pk=pk)
+    units = list(item.units.select_related("building").all())
+    active_leases = Lease.objects.filter(unit__property=item, status=Lease.Status.ACTIVE).select_related("tenant", "unit")
+    charges = list(RentCharge.objects.filter(lease__unit__property=item).select_related("lease"))
+    collected = Payment.objects.filter(
+        lease__unit__property=item, status=Payment.Status.POSTED
+    ).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    outstanding = sum((charge.balance for charge in charges if charge.due_date <= timezone.localdate()), Decimal("0"))
     context = {
-        "form": form,
-        "tenant": tenant,
+        "property": item,
+        "units": units,
+        "active_leases": active_leases,
+        "occupied": sum(unit.status == Unit.Status.OCCUPIED for unit in units),
+        "vacant": sum(unit.status == Unit.Status.AVAILABLE for unit in units),
+        "expected": sum((unit.rent_amount for unit in units), Decimal("0")),
+        "collected": collected,
+        "outstanding": outstanding,
+        "maintenance": item.units.values_list("maintenance_requests", flat=True).count(),
     }
-    return render(request, "edits/edit_Tenant.html", context) 
-def delete_tenant_view(request, id):
-    tenant = get_object_or_404(Tenant, pk=id)
-    tenant.delete()
-    return redirect('add_Tenant')       
+    return render(request, "properties/detail.html", context)
 
 
-
-
-def add_MaintenanceRequest_view(request):
+@post_login_required
+def unit_list(request):
+    form = UnitForm(request.POST or None)
     if request.method == "POST":
-        form = MaintenanceRequestForm(request.POST)
         if form.is_valid():
-            form.save()
-            #return redirect('MaintenanceRequest')   # Make sure this URL name exists
-    else:
-        form = MaintenanceRequestForm()
+            item = form.save()
+            audit(actor=_actor(request), action="unit_created", instance=item, request=request)
+            messages.success(request, f"Unit {item.unit_number} was added.")
+            return redirect("unit_detail", pk=item.pk)
+        _form_errors(request, form)
+    queryset = Unit.objects.select_related("property", "building")
+    property_id = request.GET.get("property", "")
+    status = request.GET.get("status", "")
+    query = request.GET.get("q", "").strip()
+    if property_id:
+        queryset = queryset.filter(property_id=property_id)
+    if status:
+        queryset = queryset.filter(status=status)
+    if query:
+        queryset = queryset.filter(Q(unit_number__icontains=query) | Q(property__name__icontains=query))
+    return render(
+        request,
+        "units/list.html",
+        {
+            "units": queryset,
+            "form": form,
+            "properties": Property.objects.filter(status="active"),
+            "selected_property": property_id,
+            "selected_status": status,
+            "query": query,
+            "status_choices": Unit.Status.choices,
+        },
+    )
 
-    maintenance_requests = MaintenanceRequest.objects.all()
 
-    context = {
-        "form": form,
-        "maintenance_requests": maintenance_requests,
-    }
+def unit_detail(request, pk):
+    unit = get_object_or_404(Unit.objects.select_related("property", "building"), pk=pk)
+    leases = unit.leases.select_related("tenant").all()
+    current_lease = leases.filter(status=Lease.Status.ACTIVE).first()
+    return render(
+        request,
+        "units/detail.html",
+        {
+            "unit": unit,
+            "leases": leases,
+            "current_lease": current_lease,
+            "maintenance_requests": unit.maintenance_requests.select_related("tenant")[:8],
+        },
+    )
 
-    return render(request, 'add_MaintenanceRequestform.html', context)
 
-
-
-def edit_MaintenanceRequest_view(request, id):
-    maintenance_request = get_object_or_404(MaintenanceRequest, pk=id)
-
+@post_login_required
+def tenant_list(request):
+    form = TenantForm(request.POST or None)
     if request.method == "POST":
-        form = MaintenanceRequestForm(request.POST, instance=maintenance_request)
-
         if form.is_valid():
-            form.save()
-            return redirect('add_MaintenanceRequest_page')
+            item = form.save()
+            audit(actor=_actor(request), action="tenant_created", instance=item, request=request)
+            messages.success(request, f"{item} was registered.")
+            return redirect(item)
+        _form_errors(request, form)
+    queryset = Tenant.objects.prefetch_related("leases__unit__property")
+    query = request.GET.get("q", "").strip()
+    status = request.GET.get("status", "")
+    if query:
+        queryset = queryset.filter(
+            Q(full_name__icontains=query) | Q(phone__icontains=query) | Q(national_id__icontains=query)
+        )
+    if status:
+        queryset = queryset.filter(status=status)
+    tenants = list(queryset)
+    for tenant in tenants:
+        tenant.display_lease = next((lease for lease in tenant.leases.all() if lease.status == Lease.Status.ACTIVE), None)
+        tenant.display_balance = sum((lease.balance for lease in tenant.leases.all()), Decimal("0"))
+    return render(
+        request,
+        "tenants/list.html",
+        {"tenants": tenants, "form": form, "query": query, "selected_status": status, "status_choices": Tenant.Status.choices},
+    )
 
-    else:
-        form = MaintenanceRequestForm(instance=maintenance_request)
 
-    context = {
-        "form": form,
-        "maintenance_request": maintenance_request,
-    }
+def _tenant_ledger(tenant):
+    events = []
+    leases = tenant.leases.prefetch_related("rent_charges", "payments")
+    for lease in leases:
+        for charge in lease.rent_charges.exclude(status=RentCharge.Status.VOID):
+            events.append(
+                {
+                    "date": charge.due_date,
+                    "sort": 0,
+                    "description": charge.description,
+                    "reference": lease.lease_number,
+                    "debit": charge.amount,
+                    "credit": None,
+                    "url": reverse("lease_detail", args=[lease.pk]),
+                }
+            )
+        for payment in lease.payments.filter(status=Payment.Status.POSTED):
+            events.append(
+                {
+                    "date": payment.payment_date,
+                    "sort": 1,
+                    "description": payment.get_payment_method_display(),
+                    "reference": payment.receipt_number,
+                    "debit": None,
+                    "credit": payment.amount,
+                    "url": reverse("receipt_detail", args=[payment.pk]),
+                }
+            )
+    events.sort(key=lambda event: (event["date"], event["sort"], event["reference"] or ""))
+    balance = Decimal("0")
+    for event in events:
+        balance += event["debit"] or Decimal("0")
+        balance -= event["credit"] or Decimal("0")
+        event["balance"] = balance
+    return list(reversed(events)), balance
 
-    return render(request, 'edits/edit_MaintenanceRequest.html', context)
-def delete_MaintenanceRequest_view(request, id):
-    maintenance_request = get_object_or_404(MaintenanceRequest, pk=id)
-    maintenance_request.delete()
-    return redirect('add_maintenance_request_page')    
-    
+
+def tenant_detail(request, pk):
+    tenant = get_object_or_404(Tenant, pk=pk)
+    ledger, balance = _tenant_ledger(tenant)
+    active_lease = tenant.active_lease
+    return render(
+        request,
+        "tenants/detail.html",
+        {
+            "tenant": tenant,
+            "active_lease": active_lease,
+            "leases": tenant.leases.select_related("unit__property"),
+            "ledger": ledger,
+            "balance": max(balance, Decimal("0")),
+            "credit": abs(min(balance, Decimal("0"))),
+        },
+    )
 
 
-def add_complaint_view(request):
-
+@post_login_required
+def lease_list(request):
+    form = LeaseForm(request.POST or None)
     if request.method == "POST":
-        form = ComplaintForm(request.POST)
-
         if form.is_valid():
-            form.save()
+            lease = form.save()
+            try:
+                generated = generate_rent_schedule(lease)
+            except Exception:
+                lease.delete()
+                raise
+            synchronize_occupancy(lease.unit)
+            audit(
+                actor=_actor(request),
+                action="lease_created",
+                instance=lease,
+                new_value={"charges_generated": len(generated)},
+                request=request,
+            )
+            messages.success(request, f"{lease.lease_number} was created with {len(generated)} rent charges.")
+            return redirect("lease_detail", pk=lease.pk)
+        _form_errors(request, form)
+    queryset = Lease.objects.select_related("tenant", "unit__property").prefetch_related("rent_charges")
+    status = request.GET.get("status", "")
+    if status:
+        queryset = queryset.filter(status=status)
+    return render(
+        request,
+        "leases/list.html",
+        {"leases": queryset, "form": form, "selected_status": status, "status_choices": Lease.Status.choices},
+    )
 
-    else:
-        form = ComplaintForm()
 
-    complaints = Complaint.objects.all()
+def lease_detail(request, pk):
+    lease = get_object_or_404(Lease.objects.select_related("tenant", "unit__property"), pk=pk)
+    charges = list(lease.rent_charges.prefetch_related("allocations__payment"))
+    return render(
+        request,
+        "leases/detail.html",
+        {
+            "lease": lease,
+            "charges": charges,
+            "payments": lease.payments.prefetch_related("allocations").all(),
+            "total_charged": sum((item.amount for item in charges), Decimal("0")),
+            "total_paid": sum((item.allocated_amount for item in charges), Decimal("0")),
+        },
+    )
 
-    context = {
-        'form': form,
-        'complaints': complaints,
-    }
 
-    return render(request, 'add_Complaintform.html', context)
+def payment_list(request):
+    payments = Payment.objects.select_related("lease__tenant", "lease__unit__property", "received_by").prefetch_related("allocations")
+    method = request.GET.get("method", "")
+    query = request.GET.get("q", "").strip()
+    if method:
+        payments = payments.filter(payment_method=method)
+    if query:
+        payments = payments.filter(
+            Q(reference__icontains=query)
+            | Q(receipt_number__icontains=query)
+            | Q(lease__tenant__full_name__icontains=query)
+            | Q(lease__unit__unit_number__icontains=query)
+        )
+    return render(
+        request,
+        "payments/list.html",
+        {"payments": payments, "method_choices": Payment.Method.choices, "selected_method": method, "query": query},
+    )
 
 
-def edit_Complaint_view(request, id):
-    complaint = get_object_or_404(Complaint, pk=id)
-
+@post_login_required
+def payment_create(request):
+    initial = {}
+    if request.GET.get("lease"):
+        initial["lease"] = request.GET["lease"]
+    form = PaymentForm(request.POST or None, initial=initial)
     if request.method == "POST":
-        form = ComplaintForm(request.POST, instance=complaint)
         if form.is_valid():
-            form.save()
-            return redirect('add_Complaint_page')
+            payment = post_payment(cleaned_data=form.cleaned_data, actor=_actor(request), request=request)
+            if payment.unallocated_amount:
+                messages.warning(
+                    request,
+                    f"Payment posted. UGX {payment.unallocated_amount:,.0f} remains as unallocated tenant credit.",
+                )
+            else:
+                messages.success(request, f"Payment posted and receipt {payment.receipt_number} generated.")
+            return redirect("receipt_detail", pk=payment.pk)
+        _form_errors(request, form)
+    return render(request, "payments/form.html", {"form": form})
+
+
+def receipt_detail(request, pk):
+    payment = get_object_or_404(
+        Payment.objects.select_related("lease__tenant", "lease__unit__property", "received_by").prefetch_related(
+            "allocations__charge"
+        ),
+        pk=pk,
+    )
+    previous_balance = Decimal("0")
+    if payment.lease:
+        previous_balance = sum(
+            (
+                charge.amount
+                - (
+                    charge.allocations.filter(
+                        payment__status=Payment.Status.POSTED, payment__payment_date__lt=payment.payment_date
+                    ).aggregate(total=Sum("amount"))["total"]
+                    or Decimal("0")
+                )
+                for charge in payment.lease.rent_charges.filter(due_date__lte=payment.payment_date)
+            ),
+            Decimal("0"),
+        )
+    return render(request, "payments/receipt.html", {"payment": payment, "previous_balance": max(previous_balance, Decimal("0"))})
+
+
+@post_login_required
+def payment_void(request, pk):
+    payment = get_object_or_404(Payment, pk=pk)
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    form = VoidPaymentForm(request.POST)
+    if form.is_valid():
+        void_payment(payment=payment, reason=form.cleaned_data["reason"], actor=_actor(request), request=request)
+        messages.success(request, f"{payment.receipt_number} was voided. The original record has been retained.")
     else:
-        form =ComplaintForm(instance=complaint)
+        messages.error(request, "A clear void reason of at least five characters is required.")
+    return redirect("receipt_detail", pk=payment.pk)
 
-    context = {
-        "form": form,
-        "complaint": complaint,
+
+def _arrears_buckets(charges, today):
+    buckets = {
+        "current": {"label": "Current", "amount": Decimal("0")},
+        "1_30": {"label": "1–30 days", "amount": Decimal("0")},
+        "31_60": {"label": "31–60 days", "amount": Decimal("0")},
+        "61_90": {"label": "61–90 days", "amount": Decimal("0")},
+        "90_plus": {"label": "90+ days", "amount": Decimal("0")},
     }
-    return render(request, "edits/edit_Complaint.html", context)
+    for charge in charges:
+        days = max((today - charge.due_date).days, 0)
+        key = "current" if days == 0 else "1_30" if days <= 30 else "31_60" if days <= 60 else "61_90" if days <= 90 else "90_plus"
+        buckets[key]["amount"] += charge.balance
+    total = sum((item["amount"] for item in buckets.values()), Decimal("0"))
+    for item in buckets.values():
+        item["percentage"] = round(item["amount"] / total * 100) if total else 0
+    return buckets
 
-def delete_complaint_view(request, id):
-    complaint = get_object_or_404(Complaint, pk=id)
-    complaint.delete()
-    return redirect('add_complaint_page')     
-    
+
+def arrears(request):
+    today = timezone.localdate()
+    charges = [
+        charge
+        for charge in RentCharge.objects.filter(due_date__lte=today)
+        .exclude(status__in=(RentCharge.Status.PAID, RentCharge.Status.VOID))
+        .select_related("lease__tenant", "lease__unit__property")
+        if charge.balance > 0
+    ]
+    tenants = {}
+    for charge in charges:
+        key = charge.lease_id
+        row = tenants.setdefault(
+            key,
+            {
+                "lease": charge.lease,
+                "due": Decimal("0"),
+                "paid": Decimal("0"),
+                "balance": Decimal("0"),
+                "oldest_due": charge.due_date,
+            },
+        )
+        row["due"] += charge.amount
+        row["paid"] += charge.allocated_amount
+        row["balance"] += charge.balance
+        row["oldest_due"] = min(row["oldest_due"], charge.due_date)
+    rows = sorted(tenants.values(), key=lambda row: (row["oldest_due"], -row["balance"]))
+    total = sum((row["balance"] for row in rows), Decimal("0"))
+    return render(
+        request,
+        "payments/arrears.html",
+        {"rows": rows, "total": total, "buckets": _arrears_buckets(charges, today), "today": today},
+    )
 
 
-def add_Unit_view(request):
+@post_login_required
+def maintenance_list(request):
+    form = MaintenanceRequestForm(request.POST or None)
     if request.method == "POST":
-        form = UnitForm(request.POST)
         if form.is_valid():
-            form.save()
-    else:
-        form = UnitForm()
+            item = form.save()
+            assign_reference(item)
+            audit(actor=_actor(request), action="maintenance_created", instance=item, request=request)
+            messages.success(request, f"Request {item.request_number} was created.")
+            return redirect("maintenance_list")
+        _form_errors(request, form)
+    queryset = MaintenanceRequest.objects.select_related("unit__property", "tenant")
+    status = request.GET.get("status", "")
+    if status:
+        queryset = queryset.filter(status=status)
+    return render(
+        request,
+        "maintenance/list.html",
+        {"requests": queryset, "form": form, "selected_status": status, "status_choices": MaintenanceRequest.Status.choices},
+    )
 
-    units = Unit.objects.all()
 
-    context = {
-        'form': form,
-        'units': units,
-    }
-
-    return render(request, 'add_Unitform.html', context) 
-
-
-
-
-def edit_Unit_view(request, id):
-    unit = get_object_or_404(Unit, pk=id)
-
+@post_login_required
+def expense_list(request):
+    form = ExpenseForm(request.POST or None)
     if request.method == "POST":
-        form = UnitForm(request.POST, instance=unit)
-
         if form.is_valid():
-            form.save()
-            return redirect('add_Unit_page')
-
-    else:
-        form = UnitForm(instance=unit)
-
-    context = {
-        'form': form,
-        'unit': unit,
-    }
-
-    return render(request, 'edits/edit_Unit.html', context)
-def delete_unit_view(request, id):
-    unit = get_object_or_404(Unit, pk=id)
-    unit.delete()
-    return redirect('add_Unit_page')
+            item = form.save(commit=False)
+            item.approved_by = _actor(request)
+            item.save()
+            assign_reference(item)
+            audit(actor=_actor(request), action="expense_recorded", instance=item, request=request)
+            messages.success(request, f"Expense {item.expense_number} was recorded.")
+            return redirect("expense_list")
+        _form_errors(request, form)
+    expenses = Expense.objects.select_related("property", "approved_by")
+    total = expenses.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    return render(request, "expenses/list.html", {"expenses": expenses, "form": form, "total": total})
 
 
+def reports(request):
+    rows = []
+    for property_item in Property.objects.prefetch_related("units", "expenses"):
+        income = Payment.objects.filter(
+            lease__unit__property=property_item, status=Payment.Status.POSTED
+        ).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        expenses_total = property_item.expenses.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        units = list(property_item.units.all())
+        rows.append(
+            {
+                "property": property_item,
+                "units": len(units),
+                "occupied": sum(unit.status == Unit.Status.OCCUPIED for unit in units),
+                "income": income,
+                "expenses": expenses_total,
+                "net": income - expenses_total,
+            }
+        )
+    return render(request, "reports/index.html", {"rows": rows})
 
 
+def audit_log_list(request):
+    return render(request, "audit/list.html", {"logs": AuditLog.objects.select_related("actor")[:200]})
 
 
-
-def add_Notification_view(request):
-    if request.method == "POST":
-        form = NotificationForm(request.POST)
-        if form.is_valid():
-            form.save()
-            return redirect('add_Notification_page')
-    else:
-        form = NotificationForm()
-
-    notifications = Notification.objects.all()
-
-    context = {
-        'form': form,
-        'notifications': notifications,
-    }
-
-    return render(request, 'add_Notificationform.html', context)       
+def global_search(request):
+    query = request.GET.get("q", "").strip()
+    context = {"query": query, "properties": [], "units": [], "tenants": [], "leases": [], "payments": []}
+    if query:
+        context.update(
+            {
+                "properties": Property.objects.filter(Q(name__icontains=query) | Q(address__icontains=query))[:8],
+                "units": Unit.objects.filter(Q(unit_number__icontains=query) | Q(property__name__icontains=query)).select_related("property")[:8],
+                "tenants": Tenant.objects.filter(Q(full_name__icontains=query) | Q(phone__icontains=query))[:8],
+                "leases": Lease.objects.filter(Q(lease_number__icontains=query) | Q(tenant__full_name__icontains=query)).select_related("tenant", "unit")[:8],
+                "payments": Payment.objects.filter(Q(receipt_number__icontains=query) | Q(reference__icontains=query)).select_related("lease__tenant")[:8],
+            }
+        )
+    return render(request, "search/results.html", context)
 
 
-def edit_Notification_view(request, id):
-    notification = get_object_or_404(Notification, pk=id)
-
-    if request.method == "POST":
-        form = NotificationForm(request.POST, instance=notification)
-        if form.is_valid():
-            form.save()
-            return redirect('add_Notification_page')
-    else:
-        form = NotificationForm(instance=notification)
-
-    context = {
-        "form": form,
-        "notification": notification,
-    }
-    return render(request, "edits/edit_Notification.html", context)   
-
-
-def delete_Notifications_view(request, id):
-    notification = get_object_or_404(Notification, pk=id)
-    notification.delete()
-    return redirect('add_Notification_page')
+# Compatibility names retained for old bookmarks and templates.
+login_view = dashboard
+add_property_view = property_list
+add_Unit_view = unit_list
+add_Tenant_view = tenant_list
+add_Payment_view = payment_list
+add_MaintenanceRequest_view = maintenance_list
