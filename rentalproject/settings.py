@@ -20,17 +20,30 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-r(=suoqt-nmyncu$1h^c21smfjox5l+h!0#jar5p+ln2rl@1#f'
+SECRET_KEY = os.environ.get(
+    "RENTAL_SECRET_KEY",
+    "django-insecure-development-only-change-before-production",
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get("RENTAL_DEBUG", "1").lower() in ("1", "true", "yes")
 
-ALLOWED_HOSTS = ["localhost", "127.0.0.1", "testserver"]
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get("RENTAL_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(",")
+    if host.strip()
+]
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("RENTAL_CSRF_TRUSTED_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 
 # Application definition
 
 INSTALLED_APPS = [
+    'jazzmin',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -78,8 +91,12 @@ WSGI_APPLICATION = 'rentalproject.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': os.environ.get('RENTAL_DB_ENGINE', 'django.db.backends.sqlite3'),
+        'NAME': os.environ.get('RENTAL_DB_NAME', BASE_DIR / 'db.sqlite3'),
+        'USER': os.environ.get('RENTAL_DB_USER', ''),
+        'PASSWORD': os.environ.get('RENTAL_DB_PASSWORD', ''),
+        'HOST': os.environ.get('RENTAL_DB_HOST', ''),
+        'PORT': os.environ.get('RENTAL_DB_PORT', ''),
     }
 }
 
@@ -125,6 +142,22 @@ STATICFILES_DIRS = [
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+
 LOGIN_URL = "login"
-LOGIN_REDIRECT_URL = "dashboard"
-LOGOUT_REDIRECT_URL = "dashboard"
+LOGIN_REDIRECT_URL = "home"
+LOGOUT_REDIRECT_URL = "home"
+
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
+X_FRAME_OPTIONS = "DENY"
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_HTTPONLY = True
+if not DEBUG:
+    SECURE_SSL_REDIRECT = os.environ.get("RENTAL_SECURE_SSL_REDIRECT", "1") == "1"
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = int(os.environ.get("RENTAL_HSTS_SECONDS", "31536000"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True

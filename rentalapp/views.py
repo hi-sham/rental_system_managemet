@@ -1,39 +1,96 @@
+import csv
 from collections import defaultdict
 from datetime import timedelta
 from decimal import Decimal
 from functools import wraps
 
 from django.contrib import messages
-from django.contrib.auth.views import redirect_to_login
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.db.models import Q, Sum
-from django.http import HttpResponseNotAllowed
+from django.http import FileResponse, Http404, HttpResponse, HttpResponseNotAllowed
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 
 from .forms import (
+    ApplicationDecisionForm,
+    BuildingForm,
+    CommunicationForm,
+    DocumentForm,
     ExpenseForm,
+    InspectionForm,
+    InspectionItemForm,
+    InventoryItemForm,
+    LandlordForm,
     LeaseForm,
+    LeaseAmendmentForm,
+    LeaseNoticeForm,
+    LeaseRenewalForm,
+    ManualChargeForm,
     MaintenanceRequestForm,
+    OwnerStatementForm,
     PaymentForm,
+    PaymentRefundForm,
+    PaymentReconciliationForm,
     PropertyForm,
+    RentalApplicationForm,
+    SecurityDepositTransactionForm,
     TenantForm,
     UnitForm,
+    UtilityMeterForm,
+    UtilityReadingForm,
+    VendorForm,
     VoidPaymentForm,
 )
 from .models import (
     AuditLog,
+    Building,
+    CommunicationLog,
+    Document,
     Expense,
+    Inspection,
+    InventoryItem,
+    Landlord,
     Lease,
+    LeaseAmendment,
+    LeaseNotice,
     MaintenanceRequest,
     Notification,
+    OwnerStatement,
     Payment,
+    PaymentReconciliation,
+    PaymentRefund,
     Property,
+    RentalApplication,
     RentCharge,
+    SecurityDepositTransaction,
     Tenant,
     Unit,
+    UtilityMeter,
+    UtilityReading,
+    Vendor,
 )
-from .services import assign_reference, audit, generate_rent_schedule, post_payment, synchronize_occupancy, void_payment
+from .permissions import ADMIN_ROLES, FINANCE_ROLES, OPERATIONS_ROLES, STAFF_ROLES, get_user_role, login_and_roles_required
+from .services import (
+    activate_lease,
+    approve_amendment,
+    assign_reference,
+    audit,
+    complete_inspection,
+    complete_move_out,
+    create_renewal,
+    decide_application,
+    generate_owner_statement,
+    post_deposit_transaction,
+    post_manual_charge,
+    post_payment,
+    queue_communication,
+    record_utility_reading,
+    refund_unallocated_payment,
+    serve_lease_notice,
+    synchronize_occupancy,
+    void_payment,
+)
 
 
 def _actor(request):
@@ -41,12 +98,18 @@ def _actor(request):
 
 
 def post_login_required(view):
-    """Keep the development preview readable, but never allow anonymous writes."""
+    """Allow staff to read core records and managers to change them."""
+    staff_view = login_and_roles_required(*STAFF_ROLES)(view)
+
     @wraps(view)
     def wrapped(request, *args, **kwargs):
-        if request.method == "POST" and not request.user.is_authenticated:
-            return redirect_to_login(request.get_full_path())
-        return view(request, *args, **kwargs)
+        if (
+            request.user.is_authenticated
+            and request.method not in ("GET", "HEAD", "OPTIONS")
+            and get_user_role(request.user) not in ADMIN_ROLES
+        ):
+            raise PermissionDenied("Only a property manager can change this record.")
+        return staff_view(request, *args, **kwargs)
 
     return wrapped
 
@@ -56,6 +119,19 @@ def _form_errors(request, form):
     return form
 
 
+@login_and_roles_required()
+def role_home(request):
+    role = get_user_role(request.user)
+    if role in STAFF_ROLES:
+        return redirect("dashboard")
+    if role == "tenant":
+        return redirect("tenant_portal")
+    if role == "landlord":
+        return redirect("landlord_portal")
+    raise PermissionDenied("Ask an administrator to assign this account a RentPro role.")
+
+
+@login_and_roles_required(*STAFF_ROLES)
 def dashboard(request):
     today = timezone.localdate()
     period = today.replace(day=1)
@@ -198,6 +274,7 @@ def property_list(request):
     return render(request, "properties/list.html", {"properties": properties, "form": form, "query": query, "status": status})
 
 
+@login_and_roles_required(*STAFF_ROLES)
 def property_detail(request, pk):
     item = get_object_or_404(Property.objects.select_related("owner"), pk=pk)
     units = list(item.units.select_related("building").all())
@@ -205,6 +282,10 @@ def property_detail(request, pk):
     charges = list(RentCharge.objects.filter(lease__unit__property=item).select_related("lease"))
     collected = Payment.objects.filter(
         lease__unit__property=item, status=Payment.Status.POSTED
+    ).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    collected -= PaymentRefund.objects.filter(
+        payment__lease__unit__property=item,
+        status=PaymentRefund.Status.POSTED,
     ).aggregate(total=Sum("amount"))["total"] or Decimal("0")
     outstanding = sum((charge.balance for charge in charges if charge.due_date <= timezone.localdate()), Decimal("0"))
     context = {
@@ -256,6 +337,7 @@ def unit_list(request):
     )
 
 
+@login_and_roles_required(*STAFF_ROLES)
 def unit_detail(request, pk):
     unit = get_object_or_404(Unit.objects.select_related("property", "building"), pk=pk)
     leases = unit.leases.select_related("tenant").all()
@@ -339,6 +421,7 @@ def _tenant_ledger(tenant):
     return list(reversed(events)), balance
 
 
+@login_and_roles_required(*STAFF_ROLES)
 def tenant_detail(request, pk):
     tenant = get_object_or_404(Tenant, pk=pk)
     ledger, balance = _tenant_ledger(tenant)
@@ -359,24 +442,36 @@ def tenant_detail(request, pk):
 
 @post_login_required
 def lease_list(request):
-    form = LeaseForm(request.POST or None)
+    initial = {}
+    application_id = request.GET.get("application")
+    if application_id:
+        application = RentalApplication.objects.filter(
+            pk=application_id,
+            status=RentalApplication.Status.APPROVED,
+            lease__isnull=True,
+        ).select_related("tenant", "unit").first()
+        if application:
+            initial = {
+                "application": application,
+                "tenant": application.tenant,
+                "unit": application.unit,
+                "rent_amount": application.unit.rent_amount,
+                "start_date": application.requested_move_in,
+            }
+    form = LeaseForm(request.POST or None, initial=initial)
     if request.method == "POST":
         if form.is_valid():
-            lease = form.save()
-            try:
-                generated = generate_rent_schedule(lease)
-            except Exception:
-                lease.delete()
-                raise
-            synchronize_occupancy(lease.unit)
+            lease = form.save(commit=False)
+            lease.status = Lease.Status.PENDING
+            lease.save()
             audit(
                 actor=_actor(request),
                 action="lease_created",
                 instance=lease,
-                new_value={"charges_generated": len(generated)},
+                new_value={"status": lease.status},
                 request=request,
             )
-            messages.success(request, f"{lease.lease_number} was created with {len(generated)} rent charges.")
+            messages.success(request, f"{lease.lease_number} is pending approval and move-in inspection.")
             return redirect("lease_detail", pk=lease.pk)
         _form_errors(request, form)
     queryset = Lease.objects.select_related("tenant", "unit__property").prefetch_related("rent_charges")
@@ -390,6 +485,7 @@ def lease_list(request):
     )
 
 
+@login_and_roles_required(*STAFF_ROLES)
 def lease_detail(request, pk):
     lease = get_object_or_404(Lease.objects.select_related("tenant", "unit__property"), pk=pk)
     charges = list(lease.rent_charges.prefetch_related("allocations__payment"))
@@ -402,10 +498,18 @@ def lease_detail(request, pk):
             "payments": lease.payments.prefetch_related("allocations").all(),
             "total_charged": sum((item.amount for item in charges), Decimal("0")),
             "total_paid": sum((item.allocated_amount for item in charges), Decimal("0")),
+            "deposit_held": lease.deposit_held,
+            "deposit_transactions": lease.deposit_transactions.all(),
+            "notices": lease.notices.all(),
+            "inspections": lease.inspections.all(),
+            "amendments": lease.amendments.all(),
+            "renewal_form": LeaseRenewalForm(lease=lease),
+            "charge_form": ManualChargeForm(),
         },
     )
 
 
+@login_and_roles_required(*STAFF_ROLES)
 def payment_list(request):
     payments = Payment.objects.select_related("lease__tenant", "lease__unit__property", "received_by").prefetch_related("allocations")
     method = request.GET.get("method", "")
@@ -426,7 +530,7 @@ def payment_list(request):
     )
 
 
-@post_login_required
+@login_and_roles_required(*FINANCE_ROLES)
 def payment_create(request):
     initial = {}
     if request.GET.get("lease"):
@@ -447,6 +551,7 @@ def payment_create(request):
     return render(request, "payments/form.html", {"form": form})
 
 
+@login_and_roles_required(*STAFF_ROLES)
 def receipt_detail(request, pk):
     payment = get_object_or_404(
         Payment.objects.select_related("lease__tenant", "lease__unit__property", "received_by").prefetch_related(
@@ -469,10 +574,19 @@ def receipt_detail(request, pk):
             ),
             Decimal("0"),
         )
-    return render(request, "payments/receipt.html", {"payment": payment, "previous_balance": max(previous_balance, Decimal("0"))})
+    return render(
+        request,
+        "payments/receipt.html",
+        {
+            "payment": payment,
+            "previous_balance": max(previous_balance, Decimal("0")),
+            "refund_form": PaymentRefundForm(payment=payment),
+            "refunds": payment.refunds.all(),
+        },
+    )
 
 
-@post_login_required
+@login_and_roles_required(*FINANCE_ROLES)
 def payment_void(request, pk):
     payment = get_object_or_404(Payment, pk=pk)
     if request.method != "POST":
@@ -483,6 +597,28 @@ def payment_void(request, pk):
         messages.success(request, f"{payment.receipt_number} was voided. The original record has been retained.")
     else:
         messages.error(request, "A clear void reason of at least five characters is required.")
+    return redirect("receipt_detail", pk=payment.pk)
+
+
+@login_and_roles_required(*FINANCE_ROLES)
+def payment_refund(request, pk):
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    payment = get_object_or_404(Payment, pk=pk)
+    form = PaymentRefundForm(request.POST, payment=payment)
+    if form.is_valid():
+        try:
+            refund = refund_unallocated_payment(
+                payment=payment,
+                cleaned_data=form.cleaned_data,
+                actor=_actor(request),
+                request=request,
+            )
+            messages.success(request, f"Refund {refund.refund_number} was posted.")
+        except ValidationError as error:
+            messages.error(request, _validation_message(error))
+    else:
+        messages.error(request, "Refund only available unallocated credit and provide a reference and reason.")
     return redirect("receipt_detail", pk=payment.pk)
 
 
@@ -504,6 +640,7 @@ def _arrears_buckets(charges, today):
     return buckets
 
 
+@login_and_roles_required(*STAFF_ROLES)
 def arrears(request):
     today = timezone.localdate()
     charges = [
@@ -539,7 +676,7 @@ def arrears(request):
     )
 
 
-@post_login_required
+@login_and_roles_required(*OPERATIONS_ROLES)
 def maintenance_list(request):
     form = MaintenanceRequestForm(request.POST or None)
     if request.method == "POST":
@@ -561,7 +698,7 @@ def maintenance_list(request):
     )
 
 
-@post_login_required
+@login_and_roles_required(*FINANCE_ROLES)
 def expense_list(request):
     form = ExpenseForm(request.POST or None)
     if request.method == "POST":
@@ -579,13 +716,18 @@ def expense_list(request):
     return render(request, "expenses/list.html", {"expenses": expenses, "form": form, "total": total})
 
 
+@login_and_roles_required(*STAFF_ROLES)
 def reports(request):
     rows = []
     for property_item in Property.objects.prefetch_related("units", "expenses"):
         income = Payment.objects.filter(
             lease__unit__property=property_item, status=Payment.Status.POSTED
         ).aggregate(total=Sum("amount"))["total"] or Decimal("0")
-        expenses_total = property_item.expenses.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        income -= PaymentRefund.objects.filter(
+            payment__lease__unit__property=property_item,
+            status=PaymentRefund.Status.POSTED,
+        ).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        expenses_total = property_item.expenses.filter(status="posted").aggregate(total=Sum("amount"))["total"] or Decimal("0")
         units = list(property_item.units.all())
         rows.append(
             {
@@ -600,10 +742,12 @@ def reports(request):
     return render(request, "reports/index.html", {"rows": rows})
 
 
+@login_and_roles_required(*ADMIN_ROLES)
 def audit_log_list(request):
     return render(request, "audit/list.html", {"logs": AuditLog.objects.select_related("actor")[:200]})
 
 
+@login_and_roles_required(*STAFF_ROLES)
 def global_search(request):
     query = request.GET.get("q", "").strip()
     context = {"query": query, "properties": [], "units": [], "tenants": [], "leases": [], "payments": []}
@@ -618,6 +762,601 @@ def global_search(request):
             }
         )
     return render(request, "search/results.html", context)
+
+
+def _validation_message(error):
+    if hasattr(error, "message_dict"):
+        return " ".join(message for messages_list in error.message_dict.values() for message in messages_list)
+    return " ".join(error.messages) if hasattr(error, "messages") else str(error)
+
+
+@login_and_roles_required(*ADMIN_ROLES)
+def portfolio_setup(request):
+    forms = {
+        "owner": LandlordForm(prefix="owner"),
+        "building": BuildingForm(prefix="building"),
+        "vendor": VendorForm(prefix="vendor"),
+        "inventory": InventoryItemForm(prefix="inventory"),
+    }
+    if request.method == "POST":
+        action = request.POST.get("_action", "")
+        form_classes = {
+            "owner": LandlordForm,
+            "building": BuildingForm,
+            "vendor": VendorForm,
+            "inventory": InventoryItemForm,
+        }
+        form_class = form_classes.get(action)
+        if not form_class:
+            return HttpResponseNotAllowed(["POST"])
+        form = form_class(request.POST, prefix=action)
+        forms[action] = form
+        if form.is_valid():
+            item = form.save()
+            audit(actor=_actor(request), action=f"{action}_created", instance=item, request=request)
+            messages.success(request, f"{item} was saved successfully.")
+            return redirect("portfolio_setup")
+        _form_errors(request, form)
+    return render(
+        request,
+        "operations/portfolio.html",
+        {
+            "forms": forms,
+            "owners": Landlord.objects.prefetch_related("properties"),
+            "buildings": Building.objects.select_related("property"),
+            "vendors": Vendor.objects.all(),
+            "inventory_items": InventoryItem.objects.select_related("unit__property")[:100],
+        },
+    )
+
+
+@login_and_roles_required(*ADMIN_ROLES)
+def application_list(request):
+    form = RentalApplicationForm(request.POST or None)
+    if request.method == "POST":
+        if form.is_valid():
+            item = form.save()
+            assign_reference(item)
+            if item.unit.status == Unit.Status.AVAILABLE:
+                item.unit.status = Unit.Status.APPLICATION_PENDING
+                item.unit.save(update_fields=("status", "updated_at"))
+            audit(actor=_actor(request), action="application_submitted", instance=item, request=request)
+            messages.success(request, f"Application {item.application_number} was submitted.")
+            return redirect("application_list")
+        _form_errors(request, form)
+    status = request.GET.get("status", "")
+    applications = RentalApplication.objects.select_related("unit__property", "tenant", "decided_by")
+    if status:
+        applications = applications.filter(status=status)
+    return render(
+        request,
+        "applications/list.html",
+        {
+            "applications": applications,
+            "form": form,
+            "decision_form": ApplicationDecisionForm(),
+            "status_choices": RentalApplication.Status.choices,
+            "selected_status": status,
+        },
+    )
+
+
+@login_and_roles_required(*ADMIN_ROLES)
+def application_decide(request, pk):
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    application = get_object_or_404(RentalApplication, pk=pk)
+    form = ApplicationDecisionForm(request.POST)
+    if form.is_valid():
+        try:
+            decide_application(
+                application=application,
+                decision=form.cleaned_data["decision"],
+                reason=form.cleaned_data.get("reason", ""),
+                actor=_actor(request),
+                request=request,
+            )
+            messages.success(request, f"{application.application_number} is now {application.get_status_display()}.")
+        except ValidationError as error:
+            messages.error(request, _validation_message(error))
+    else:
+        messages.error(request, _validation_message(ValidationError(form.errors.as_text())))
+    return redirect("application_list")
+
+
+@login_and_roles_required(*ADMIN_ROLES)
+def lease_activate(request, pk):
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    lease = get_object_or_404(Lease, pk=pk)
+    try:
+        activate_lease(lease=lease, actor=_actor(request), request=request)
+        messages.success(request, f"{lease.lease_number} is active and its billing schedule was generated.")
+    except ValidationError as error:
+        messages.error(request, _validation_message(error))
+    return redirect("lease_detail", pk=lease.pk)
+
+
+@login_and_roles_required(*ADMIN_ROLES)
+def lease_renew(request, pk):
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    lease = get_object_or_404(Lease, pk=pk)
+    form = LeaseRenewalForm(request.POST, lease=lease)
+    if form.is_valid():
+        try:
+            renewal = create_renewal(
+                lease=lease,
+                actor=_actor(request),
+                request=request,
+                **form.cleaned_data,
+            )
+            messages.success(request, f"Renewal {renewal.lease_number} was created for approval.")
+            return redirect("lease_detail", pk=renewal.pk)
+        except ValidationError as error:
+            messages.error(request, _validation_message(error))
+    else:
+        messages.error(request, "Correct the renewal dates and amount.")
+    return redirect("lease_detail", pk=lease.pk)
+
+
+@login_and_roles_required(*ADMIN_ROLES)
+def lease_close(request, pk):
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    lease = get_object_or_404(Lease, pk=pk)
+    try:
+        complete_move_out(
+            lease=lease,
+            actor=_actor(request),
+            reason=request.POST.get("reason", "Move-out completed"),
+            request=request,
+        )
+        messages.success(request, f"{lease.lease_number} was closed and the unit is available.")
+    except ValidationError as error:
+        messages.error(request, _validation_message(error))
+    return redirect("lease_detail", pk=lease.pk)
+
+
+@login_and_roles_required(*FINANCE_ROLES)
+def lease_charge(request, pk):
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    lease = get_object_or_404(Lease, pk=pk)
+    form = ManualChargeForm(request.POST)
+    if form.is_valid():
+        try:
+            post_manual_charge(
+                lease=lease,
+                cleaned_data=form.cleaned_data,
+                actor=_actor(request),
+                request=request,
+            )
+            messages.success(request, "The charge or credit was posted to the tenant ledger.")
+        except ValidationError as error:
+            messages.error(request, _validation_message(error))
+    else:
+        messages.error(request, "Correct the manual charge details.")
+    return redirect("lease_detail", pk=lease.pk)
+
+
+@login_and_roles_required(*ADMIN_ROLES)
+def notice_list(request):
+    form = LeaseNoticeForm(request.POST or None, initial={"lease": request.GET.get("lease")})
+    if request.method == "POST":
+        if form.is_valid():
+            notice = form.save()
+            assign_reference(notice)
+            try:
+                serve_lease_notice(notice=notice, actor=_actor(request), request=request)
+                messages.success(request, f"Notice {notice.notice_number} was served.")
+            except ValidationError as error:
+                messages.error(request, _validation_message(error))
+            return redirect("notice_list")
+        _form_errors(request, form)
+    return render(
+        request,
+        "leases/notices.html",
+        {"notices": LeaseNotice.objects.select_related("lease__tenant", "lease__unit", "served_by"), "form": form},
+    )
+
+
+@login_and_roles_required(*OPERATIONS_ROLES)
+def inspection_list(request):
+    inspection_initial = {}
+    if request.GET.get("lease"):
+        linked_lease = Lease.objects.filter(pk=request.GET["lease"]).first()
+        if linked_lease:
+            inspection_initial = {"lease": linked_lease, "unit": linked_lease.unit}
+    form = InspectionForm(request.POST or None, initial=inspection_initial)
+    if request.method == "POST":
+        if form.is_valid():
+            item = form.save()
+            assign_reference(item)
+            audit(actor=_actor(request), action="inspection_scheduled", instance=item, request=request)
+            messages.success(request, f"Inspection {item.inspection_number} was scheduled.")
+            return redirect("inspection_detail", pk=item.pk)
+        _form_errors(request, form)
+    return render(
+        request,
+        "inspections/list.html",
+        {"inspections": Inspection.objects.select_related("unit__property", "lease__tenant", "inspector"), "form": form},
+    )
+
+
+@login_and_roles_required(*OPERATIONS_ROLES)
+def inspection_detail(request, pk):
+    inspection = get_object_or_404(Inspection.objects.select_related("unit__property", "lease__tenant", "inspector"), pk=pk)
+    form = InspectionItemForm(request.POST or None)
+    if request.method == "POST":
+        if form.is_valid():
+            item = form.save(commit=False)
+            item.inspection = inspection
+            item.save()
+            messages.success(request, f"{item.item} was added to the checklist.")
+            return redirect("inspection_detail", pk=inspection.pk)
+        _form_errors(request, form)
+    return render(request, "inspections/detail.html", {"inspection": inspection, "form": form})
+
+
+@login_and_roles_required(*OPERATIONS_ROLES)
+def inspection_complete(request, pk):
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    inspection = get_object_or_404(Inspection, pk=pk)
+    try:
+        complete_inspection(
+            inspection=inspection,
+            actor=_actor(request),
+            acknowledged=bool(request.POST.get("acknowledged")),
+            request=request,
+        )
+        messages.success(request, f"Inspection {inspection.inspection_number} was completed.")
+    except ValidationError as error:
+        messages.error(request, _validation_message(error))
+    return redirect("inspection_detail", pk=inspection.pk)
+
+
+@login_and_roles_required(*FINANCE_ROLES)
+def deposit_list(request):
+    form = SecurityDepositTransactionForm(request.POST or None, initial={"lease": request.GET.get("lease")})
+    if request.method == "POST":
+        if form.is_valid():
+            try:
+                item = post_deposit_transaction(cleaned_data=form.cleaned_data, actor=_actor(request), request=request)
+                messages.success(request, f"Deposit transaction for {item.lease.lease_number} was posted.")
+                return redirect("deposit_list")
+            except ValidationError as error:
+                messages.error(request, _validation_message(error))
+        else:
+            _form_errors(request, form)
+    return render(
+        request,
+        "finance/deposits.html",
+        {
+            "transactions": SecurityDepositTransaction.objects.select_related("lease__tenant", "lease__unit", "posted_by"),
+            "form": form,
+        },
+    )
+
+
+@login_and_roles_required(*OPERATIONS_ROLES)
+def utility_list(request):
+    meter_form = UtilityMeterForm(prefix="meter")
+    reading_form = UtilityReadingForm(prefix="reading")
+    if request.method == "POST":
+        action = request.POST.get("_action")
+        if action == "meter":
+            meter_form = UtilityMeterForm(request.POST, prefix="meter")
+            if meter_form.is_valid():
+                meter = meter_form.save()
+                audit(actor=_actor(request), action="utility_meter_created", instance=meter, request=request)
+                messages.success(request, f"Meter {meter.meter_number} was added.")
+                return redirect("utility_list")
+            _form_errors(request, meter_form)
+        elif action == "reading":
+            reading_form = UtilityReadingForm(request.POST, prefix="reading")
+            if reading_form.is_valid():
+                try:
+                    reading = record_utility_reading(
+                        cleaned_data=reading_form.cleaned_data,
+                        actor=_actor(request),
+                        request=request,
+                    )
+                    messages.success(request, f"Reading recorded; {reading.amount:,.0f} was added to the tenant ledger.")
+                    return redirect("utility_list")
+                except ValidationError as error:
+                    messages.error(request, _validation_message(error))
+            else:
+                _form_errors(request, reading_form)
+        else:
+            return HttpResponseNotAllowed(["POST"])
+    return render(
+        request,
+        "operations/utilities.html",
+        {
+            "meters": UtilityMeter.objects.select_related("unit__property"),
+            "readings": UtilityReading.objects.select_related("meter__unit__property", "charge")[:100],
+            "meter_form": meter_form,
+            "reading_form": reading_form,
+        },
+    )
+
+
+@login_and_roles_required(*STAFF_ROLES)
+def document_list(request):
+    form = DocumentForm(request.POST or None, request.FILES or None)
+    if request.method == "POST":
+        if get_user_role(request.user) not in ADMIN_ROLES:
+            raise PermissionDenied("Only a manager can upload documents.")
+        if form.is_valid():
+            item = form.save(commit=False)
+            item.uploaded_by = _actor(request)
+            item.save()
+            audit(actor=_actor(request), action="document_uploaded", instance=item, request=request)
+            messages.success(request, f"{item.title} was uploaded.")
+            return redirect("document_list")
+        _form_errors(request, form)
+    return render(request, "operations/documents.html", {"documents": Document.objects.select_related("uploaded_by")[:200], "form": form})
+
+
+@login_and_roles_required()
+def document_download(request, pk):
+    item = get_object_or_404(Document, pk=pk)
+    role = get_user_role(request.user)
+    allowed = role in STAFF_ROLES
+    if role == "tenant":
+        tenant = getattr(request.user, "tenant_profile", None)
+        allowed = bool(
+            tenant
+            and not item.is_private
+            and item.object_type.lower() == "tenant"
+            and item.object_id == str(tenant.pk)
+        )
+    elif role == "landlord":
+        owner = getattr(request.user, "landlord_profile", None)
+        allowed = bool(
+            owner
+            and not item.is_private
+            and item.object_type.lower() in ("landlord", "owner")
+            and item.object_id == str(owner.pk)
+        )
+    if not allowed:
+        raise PermissionDenied("You do not have access to this document.")
+    try:
+        return FileResponse(item.file.open("rb"), as_attachment=False, filename=item.file.name.rsplit("/", 1)[-1])
+    except FileNotFoundError as error:
+        raise Http404("The document file is missing.") from error
+
+
+@login_and_roles_required(*STAFF_ROLES)
+def communication_list(request):
+    form = CommunicationForm(request.POST or None)
+    if request.method == "POST":
+        if form.is_valid():
+            item = queue_communication(cleaned_data=form.cleaned_data, actor=_actor(request))
+            label = "sent" if item.status == CommunicationLog.Status.SENT else "queued for delivery"
+            messages.success(request, f"Message to {item.recipient_name} was {label}.")
+            return redirect("communication_list")
+        _form_errors(request, form)
+    return render(
+        request,
+        "communications/list.html",
+        {"communications": CommunicationLog.objects.select_related("created_by")[:200], "form": form},
+    )
+
+
+@login_and_roles_required(*FINANCE_ROLES)
+def owner_statement_list(request):
+    form = OwnerStatementForm(request.POST or None)
+    if request.method == "POST":
+        if form.is_valid():
+            try:
+                item = generate_owner_statement(cleaned_data=form.cleaned_data, actor=_actor(request), request=request)
+                messages.success(request, f"Statement {item.statement_number} was generated.")
+                return redirect("owner_statement_detail", pk=item.pk)
+            except ValidationError as error:
+                messages.error(request, _validation_message(error))
+        else:
+            _form_errors(request, form)
+    return render(
+        request,
+        "accounting/statements.html",
+        {"statements": OwnerStatement.objects.select_related("owner", "property", "approved_by"), "form": form},
+    )
+
+
+@login_and_roles_required(*FINANCE_ROLES)
+def owner_statement_detail(request, pk):
+    statement = get_object_or_404(OwnerStatement.objects.select_related("owner", "property", "approved_by"), pk=pk)
+    return render(request, "accounting/statement_detail.html", {"statement": statement})
+
+
+@login_and_roles_required(*FINANCE_ROLES)
+def owner_statement_action(request, pk):
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    statement = get_object_or_404(OwnerStatement, pk=pk)
+    action = request.POST.get("action")
+    if action == "approve" and statement.status == OwnerStatement.Status.DRAFT:
+        statement.status = OwnerStatement.Status.APPROVED
+        statement.approved_by = _actor(request)
+        statement.approved_at = timezone.now()
+        fields = ("status", "approved_by", "approved_at", "updated_at")
+    elif action == "pay" and statement.status == OwnerStatement.Status.APPROVED:
+        reference = request.POST.get("reference", "").strip()
+        if not reference:
+            messages.error(request, "A payout reference is required.")
+            return redirect("owner_statement_detail", pk=statement.pk)
+        statement.status = OwnerStatement.Status.PAID
+        statement.paid_at = timezone.now()
+        statement.payout_reference = reference
+        fields = ("status", "paid_at", "payout_reference", "updated_at")
+    else:
+        messages.error(request, "That statement action is not allowed in its current status.")
+        return redirect("owner_statement_detail", pk=statement.pk)
+    statement.save(update_fields=fields)
+    audit(actor=_actor(request), action=f"owner_statement_{action}", instance=statement, request=request)
+    messages.success(request, f"Statement {statement.statement_number} was {action}d.")
+    return redirect("owner_statement_detail", pk=statement.pk)
+
+
+@login_and_roles_required(*FINANCE_ROLES)
+def reconciliation_list(request):
+    form = PaymentReconciliationForm(request.POST or None)
+    if request.method == "POST":
+        if form.is_valid():
+            item = form.save(commit=False)
+            if item.payment_id:
+                item.status = PaymentReconciliation.Status.MATCHED
+                item.matched_by = _actor(request)
+                item.matched_at = timezone.now()
+            item.save()
+            audit(actor=_actor(request), action="payment_reconciliation_imported", instance=item, request=request)
+            messages.success(request, f"Transaction {item.external_reference} was imported.")
+            return redirect("reconciliation_list")
+        _form_errors(request, form)
+    return render(
+        request,
+        "finance/reconciliation.html",
+        {"items": PaymentReconciliation.objects.select_related("payment", "matched_by")[:200], "form": form},
+    )
+
+
+@login_and_roles_required(*ADMIN_ROLES)
+def amendment_list(request):
+    form = LeaseAmendmentForm(request.POST or None)
+    if request.method == "POST":
+        if form.is_valid():
+            item = form.save()
+            audit(actor=_actor(request), action="lease_amendment_created", instance=item, request=request)
+            messages.success(request, "The amendment was saved as a draft.")
+            return redirect("amendment_list")
+        _form_errors(request, form)
+    return render(
+        request,
+        "leases/amendments.html",
+        {"amendments": LeaseAmendment.objects.select_related("lease__tenant", "approved_by"), "form": form},
+    )
+
+
+@login_and_roles_required(*ADMIN_ROLES)
+def amendment_approve(request, pk):
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    amendment = get_object_or_404(LeaseAmendment, pk=pk)
+    try:
+        approve_amendment(amendment=amendment, actor=_actor(request), request=request)
+        messages.success(request, "The amendment was approved and applied to the lease.")
+    except (ValidationError, ValueError) as error:
+        messages.error(request, _validation_message(error) if isinstance(error, ValidationError) else str(error))
+    return redirect("amendment_list")
+
+
+@login_and_roles_required(*OPERATIONS_ROLES)
+def maintenance_transition(request, pk):
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    item = get_object_or_404(MaintenanceRequest, pk=pk)
+    target = request.POST.get("status", "")
+    allowed = {
+        MaintenanceRequest.Status.NEW: (MaintenanceRequest.Status.REVIEWED, MaintenanceRequest.Status.ASSIGNED),
+        MaintenanceRequest.Status.REVIEWED: (MaintenanceRequest.Status.ASSIGNED,),
+        MaintenanceRequest.Status.ASSIGNED: (MaintenanceRequest.Status.IN_PROGRESS,),
+        MaintenanceRequest.Status.IN_PROGRESS: (MaintenanceRequest.Status.AWAITING_PARTS, MaintenanceRequest.Status.COMPLETED),
+        MaintenanceRequest.Status.AWAITING_PARTS: (MaintenanceRequest.Status.IN_PROGRESS, MaintenanceRequest.Status.COMPLETED),
+        MaintenanceRequest.Status.COMPLETED: (MaintenanceRequest.Status.VERIFIED,),
+        MaintenanceRequest.Status.VERIFIED: (MaintenanceRequest.Status.CLOSED,),
+    }
+    if target not in allowed.get(item.status, ()):
+        messages.error(request, "That maintenance transition is not allowed.")
+        return redirect("maintenance_list")
+    old = item.status
+    item.status = target
+    if target == MaintenanceRequest.Status.ASSIGNED:
+        item.approved_by = _actor(request)
+        item.approved_at = timezone.now()
+    if target == MaintenanceRequest.Status.COMPLETED:
+        item.completed_at = timezone.now()
+        item.resolution = request.POST.get("resolution", item.resolution)
+    if target == MaintenanceRequest.Status.VERIFIED:
+        item.tenant_verified = True
+    item.save()
+    audit(
+        actor=_actor(request),
+        action="maintenance_status_changed",
+        instance=item,
+        old_value={"status": old},
+        new_value={"status": target},
+        request=request,
+    )
+    messages.success(request, f"{item.request_number} is now {item.get_status_display()}.")
+    return redirect("maintenance_list")
+
+
+@login_and_roles_required(*STAFF_ROLES)
+def reports_export(request):
+    response = HttpResponse(content_type="text/csv")
+    response["Content-Disposition"] = 'attachment; filename="rentpro-property-performance.csv"'
+    writer = csv.writer(response)
+    writer.writerow(("Property", "Owner", "Units", "Occupied", "Income (UGX)", "Expenses (UGX)", "Net (UGX)"))
+    for property_item in Property.objects.select_related("owner").prefetch_related("units", "expenses"):
+        income = Payment.objects.filter(
+            lease__unit__property=property_item,
+            status=Payment.Status.POSTED,
+        ).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        income -= PaymentRefund.objects.filter(
+            payment__lease__unit__property=property_item,
+            status=PaymentRefund.Status.POSTED,
+        ).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        expense_total = property_item.expenses.filter(status="posted").aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        units = list(property_item.units.all())
+        writer.writerow(
+            (
+                property_item.name,
+                str(property_item.owner or ""),
+                len(units),
+                sum(unit.status == Unit.Status.OCCUPIED for unit in units),
+                income,
+                expense_total,
+                income - expense_total,
+            )
+        )
+    return response
+
+
+@login_and_roles_required(*STAFF_ROLES, "tenant")
+def tenant_portal(request):
+    tenant = getattr(request.user, "tenant_profile", None)
+    if not tenant:
+        raise PermissionDenied("This account is not linked to a tenant.")
+    ledger, balance = _tenant_ledger(tenant)
+    return render(
+        request,
+        "portals/tenant.html",
+        {
+            "tenant": tenant,
+            "lease": tenant.active_lease,
+            "ledger": ledger,
+            "balance": max(balance, Decimal("0")),
+            "maintenance_requests": tenant.maintenance_requests.select_related("unit")[:10],
+            "documents": Document.objects.filter(object_type="tenant", object_id=str(tenant.pk), is_private=False),
+        },
+    )
+
+
+@login_and_roles_required(*STAFF_ROLES, "landlord")
+def landlord_portal(request):
+    owner = getattr(request.user, "landlord_profile", None)
+    if not owner:
+        raise PermissionDenied("This account is not linked to a landlord.")
+    properties = owner.properties.prefetch_related("units", "expenses")
+    statements = owner.statements.filter(status__in=(OwnerStatement.Status.APPROVED, OwnerStatement.Status.PAID))
+    return render(
+        request,
+        "portals/landlord.html",
+        {"owner": owner, "properties": properties, "statements": statements},
+    )
 
 
 # Compatibility names retained for old bookmarks and templates.
